@@ -34,6 +34,11 @@ spring:
     multipart:
       max-file-size: 512000    #限制上传文件大小为500k 500x1024
       max-request-size: 512000  #限制请求文件大小为500k
+  redis:
+    database: 1
+    host: localhost
+    port: 6379
+    password: vagrant
 ############################################################
 #
 # mybatis 配置
