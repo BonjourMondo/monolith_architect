@@ -1,12 +1,10 @@
 package com.imooc.controller;
 
 import com.imooc.pojo.Users;
+import com.imooc.pojo.bo.ShopcartBO;
 import com.imooc.pojo.bo.UserBO;
 import com.imooc.service.UserService;
-import com.imooc.utils.CookieUtils;
-import com.imooc.utils.IMOOCJSONResult;
-import com.imooc.utils.JsonUtils;
-import com.imooc.utils.MD5Utils;
+import com.imooc.utils.*;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 import org.apache.commons.lang3.StringUtils;
@@ -15,6 +13,8 @@ import org.springframework.web.bind.annotation.*;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Author: leesanghyuk
@@ -24,9 +24,11 @@ import javax.servlet.http.HttpServletResponse;
 @Api(value = "注册登陆", tags = {"用于注册登陆相关的接口"})
 @RestController
 @RequestMapping("passport")
-public class PassportController {
+public class PassportController extends BasicController{
     @Autowired
-    public UserService userService;
+    private UserService userService;
+    @Autowired
+    private RedisOperator redisOperator;
 
     @ApiOperation(value = "用户名查重", notes = "用户名查重", httpMethod = "GET")
     @GetMapping("/usernameIsExist")
@@ -47,7 +49,8 @@ public class PassportController {
 
     @ApiOperation(value = "用户注册", notes = "用户注册", httpMethod = "POST")
     @PostMapping("/regist")
-    public IMOOCJSONResult regist(@RequestBody UserBO userBO) {
+    public IMOOCJSONResult regist(@RequestBody UserBO userBO,
+                                  HttpServletRequest request, HttpServletResponse response) {
         String username = userBO.getUsername();
         String password = userBO.getPassword();
         String confirmPWD = userBO.getConfirmPassword();
@@ -69,9 +72,10 @@ public class PassportController {
             return IMOOCJSONResult.errorMsg("两次密码输入不一致");
         }
         //5. 实现注册
-        userService.createUser(userBO);
+        Users userResult=userService.createUser(userBO);
         // TODO: 2020-01-31 创建用户token，存入redis缓存
-        // TODO: 2020-01-31 同步购物车数据
+        //同步购物车数据
+        syncShopcartData(userResult.getId(),request,response);
         return IMOOCJSONResult.ok();
     }
 
@@ -94,7 +98,8 @@ public class PassportController {
         CookieUtils.setCookie(request,response,"user",
                 JsonUtils.objectToJson(userResult),true);
         // TODO: 2020-01-31 创建用户token，存入redis缓存
-        // TODO: 2020-01-31 同步购物车数据
+        //同步购物车数据
+        syncShopcartData(userResult.getId(),request,response);
         return IMOOCJSONResult.ok(userResult);
     }
 
@@ -103,7 +108,8 @@ public class PassportController {
     public IMOOCJSONResult logout(@RequestParam String userId,
                                   HttpServletRequest request,HttpServletResponse response){
         CookieUtils.deleteCookie(request,response,"user");
-        // TODO: 2020-01-29 用户退出时，需要清空购物车
+        // 用户退出时，需要清空购物车
+        CookieUtils.deleteCookie(request,response,FOODIE_SHOPCART);
         // TODO: 2020-01-29 分布式会话中需要清除用户数据
         return IMOOCJSONResult.ok();
     }
@@ -115,4 +121,52 @@ public class PassportController {
         return userResult;
     }
 
+    /**
+     * 同步cookie和redis中的购物车数据：
+     * 如果cookie和redis数据都为空，那么不做任何处理
+     * 如果某一个数据为空，那么使得两个数据相同
+     * 如果都不为空，如果存在cookie中的数据与redis数据相同的部分，以cookie为准再同步
+     */
+    private void syncShopcartData(String userId,HttpServletRequest request, HttpServletResponse response){
+        //redis
+        String shopcartStrRedis = redisOperator.get(FOODIE_SHOPCART + ":" + userId);
+        //cookie
+        String shopcartStrCookie=CookieUtils.getCookieValue(request,FOODIE_SHOPCART,true);
+        if (StringUtils.isBlank(shopcartStrRedis)){
+            if (StringUtils.isNotBlank(shopcartStrCookie)){
+                redisOperator.set(FOODIE_SHOPCART + ":" + userId,shopcartStrCookie);
+            }
+        }else{
+            if (StringUtils.isBlank(shopcartStrCookie)){
+                CookieUtils.setCookie(request,response,FOODIE_SHOPCART,shopcartStrRedis,true);
+            }else{
+                //两者都不为空
+                List<ShopcartBO> shopcartBORedisList=JsonUtils.jsonToList(shopcartStrRedis,ShopcartBO.class);
+                List<ShopcartBO> shopcartBOCookieList=JsonUtils.jsonToList(shopcartStrCookie,ShopcartBO.class);
+
+                //定义一个待删除List
+                List<ShopcartBO> pendingDeleteList=new ArrayList<>();
+                for (ShopcartBO redisBo:shopcartBORedisList){
+                    String redisSpecId=redisBo.getSpecId();
+                    for (ShopcartBO cookieBo: shopcartBOCookieList){
+                        String cookieSpecId=cookieBo.getSpecId();
+                        if (redisSpecId.equalsIgnoreCase(cookieSpecId)){
+                            //覆盖购买数目，不是累加
+                            redisBo.setBuyCounts(cookieBo.getBuyCounts());
+                            //把cookieBo放入待删除列表，用于最后的合并
+                            pendingDeleteList.add(cookieBo);
+                        }
+                    }
+                }
+                //删除cookie中重复的
+                shopcartBOCookieList.removeAll(pendingDeleteList);
+                //合并两个
+                shopcartBORedisList.addAll(shopcartBOCookieList);
+                //以现在的redisList为准，更新redis和cookie
+                redisOperator.set(FOODIE_SHOPCART+":"+userId,JsonUtils.objectToJson(shopcartBORedisList));
+                CookieUtils.setCookie(request,response,FOODIE_SHOPCART,JsonUtils.objectToJson(shopcartBORedisList),true);
+            }
+        }
+
+    }
 }
